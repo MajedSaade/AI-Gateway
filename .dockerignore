@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+local_test_store.json
+uploads/

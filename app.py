@@ -1,223 +1,360 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import FileResponse, Response
-from ultralytics import YOLO
-from PIL import Image
-import sqlite3
+import asyncio
+import base64
+import datetime as dt
+import io
+import logging
 import os
+from typing import Optional
 import uuid
-import shutil
 
-# Disable GPU usage
-import torch
-torch.cuda.is_available = lambda: False
+import boto3
+import httpx
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, HTTPException
+from PIL import Image
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from tinydb import TinyDB
+from ultralytics import YOLO
 
-app = FastAPI()
+load_dotenv()
 
-UPLOAD_DIR = 'uploads/original'
-PREDICTED_DIR = "uploads/predicted"
-DB_PATH = "predictions.db"
+app = FastAPI(title="ChatOps AI Gateway")
+YOLO_MODEL = YOLO("yolov8n.pt")
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PREDICTED_DIR, exist_ok=True)
 
-# Download the AI model (tiny model ~6MB)
-model = YOLO("yolov8n.pt")  
+class CommandPayload(BaseModel):
+    user_id: str
+    command_text: str
+    image_url: Optional[str] = None
 
-# Initialize SQLite
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        # Create the predictions main table to store the prediction session
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS prediction_sessions (
-                uid TEXT PRIMARY KEY,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                original_image TEXT,
-                predicted_image TEXT
+
+def _storage_backend() -> str:
+    return os.getenv("STORAGE_BACKEND", "s3").strip().lower()
+
+
+def _nosql_db_path() -> str:
+    return os.getenv("NOSQL_DB_PATH", "local_test_store.json")
+
+
+def _ollama_base_url() -> str:
+    return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
+
+
+def _ollama_generate_path() -> str:
+    path = os.getenv("OLLAMA_GENERATE_PATH", "/api/generate").strip()
+    return path if path.startswith("/") else f"/{path}"
+
+
+def _ollama_generate_url() -> str:
+    return f"{_ollama_base_url().rstrip('/')}{_ollama_generate_path()}"
+
+
+def _ollama_model_ask() -> str:
+    return os.getenv("OLLAMA_MODEL_ASK", "llama3.2:1b").strip()
+
+
+def _ollama_model_analyze() -> str:
+    return os.getenv("OLLAMA_MODEL_ANALYZE", "llava").strip()
+
+
+def _ollama_timeout_seconds() -> float:
+    timeout_str = os.getenv("OLLAMA_TIMEOUT_SECONDS", "60").strip()
+    try:
+        return float(timeout_str)
+    except ValueError:
+        return 60.0
+
+
+def _get_bucket_name() -> str:
+    bucket = os.getenv("S3_BUCKET_NAME")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET_NAME is not set")
+    return bucket
+
+
+async def save_prompt_to_s3(user_id: str, prompt: str) -> str:
+    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    key = f"prompts/{user_id}_{timestamp}.txt"
+    s3_client = boto3.client("s3")
+
+    try:
+        await asyncio.to_thread(
+            s3_client.put_object,
+            Bucket=_get_bucket_name(),
+            Key=key,
+            Body=prompt.encode("utf-8"),
+            ContentType="text/plain",
+        )
+    except (BotoCoreError, ClientError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail="Failed to upload prompt to S3") from exc
+
+    return key
+
+
+def _save_to_nosql(record: dict) -> str:
+    db = TinyDB(_nosql_db_path())
+    try:
+        doc_id = db.insert(record)
+        return str(doc_id)
+    finally:
+        db.close()
+
+
+async def save_prompt(user_id: str, prompt: str) -> str:
+    if _storage_backend() == "nosql":
+        record_id = await asyncio.to_thread(
+            _save_to_nosql,
+            {
+                "id": str(uuid.uuid4()),
+                "kind": "prompt",
+                "user_id": user_id,
+                "prompt": prompt,
+                "timestamp": dt.datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        return f"nosql/prompts/{record_id}"
+
+    return await save_prompt_to_s3(user_id, prompt)
+
+
+async def download_image(image_url: str) -> bytes:
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(image_url)
+            response.raise_for_status()
+            return response.content
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=500, detail="Failed to download image") from exc
+
+
+async def save_image(user_id: str, image_bytes: bytes, prefix: str) -> str:
+    if _storage_backend() == "nosql":
+        record_id = await asyncio.to_thread(
+            _save_to_nosql,
+            {
+                "id": str(uuid.uuid4()),
+                "kind": "image",
+                "prefix": prefix,
+                "user_id": user_id,
+                "content_type": "image/jpeg",
+                "image_b64": base64.b64encode(image_bytes).decode("utf-8"),
+                "timestamp": dt.datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        return f"nosql/{prefix}/{record_id}"
+
+    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    key = f"{prefix}/{user_id}_{timestamp}.jpg"
+
+    s3_client = boto3.client("s3")
+    try:
+        await asyncio.to_thread(
+            s3_client.put_object,
+            Bucket=_get_bucket_name(),
+            Key=key,
+            Body=image_bytes,
+            ContentType="image/jpeg",
+        )
+    except (BotoCoreError, ClientError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail="Failed to upload image to S3") from exc
+
+    return key
+
+
+async def download_image_and_upload_to_s3(
+    user_id: str,
+    image_url: str,
+    prefix: str,
+) -> tuple[str, bytes]:
+    image_bytes = await download_image(image_url)
+    key = await save_image(user_id=user_id, image_bytes=image_bytes, prefix=prefix)
+    return key, image_bytes
+
+
+def _extract_upstream_error(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            for key in ("error", "message", "detail"):
+                value = data.get(key)
+                if value:
+                    return str(value)[:240]
+        if data:
+            return str(data)[:240]
+    except ValueError:
+        pass
+
+    text = response.text.strip().replace("\n", " ")
+    return (text[:240] if text else "empty response body")
+
+
+async def call_ollama_generate(payload: dict, command_prefix: str) -> str:
+    generate_url = _ollama_generate_url()
+    model_name = str(payload.get("model", ""))
+    logger.info(
+        "Ollama route prefix=%s outbound_url=%s model=%s",
+        command_prefix,
+        generate_url,
+        model_name,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=_ollama_timeout_seconds()) as client:
+            response = await client.post(generate_url, json=payload)
+
+        logger.info(
+            "Ollama response prefix=%s outbound_url=%s model=%s status=%s",
+            command_prefix,
+            generate_url,
+            model_name,
+            response.status_code,
+        )
+
+        if response.status_code != 200:
+            upstream_error = _extract_upstream_error(response)
+            logger.error(
+                "Ollama failure prefix=%s outbound_url=%s model=%s status=%s error=%s",
+                command_prefix,
+                generate_url,
+                model_name,
+                response.status_code,
+                upstream_error,
             )
-        """)
-        
-        # Create the objects table to store individual detected objects in a given image
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS detection_objects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prediction_uid TEXT,
-                label TEXT,
-                score REAL,
-                box TEXT,
-                FOREIGN KEY (prediction_uid) REFERENCES prediction_sessions (uid)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Ollama error ({response.status_code}): {upstream_error}",
             )
-        """)
-        
-        # Create index for faster queries
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_uid ON detection_objects (prediction_uid)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_label ON detection_objects (label)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON detection_objects (score)")
 
-init_db()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Ollama returned invalid JSON") from exc
 
-def save_prediction_session(uid, original_image, predicted_image):
-    """
-    Save prediction session to database
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO prediction_sessions (uid, original_image, predicted_image)
-            VALUES (?, ?, ?)
-        """, (uid, original_image, predicted_image))
+        return str(data.get("response", ""))
+    except httpx.TimeoutException as exc:
+        logger.error(
+            "Ollama unavailable prefix=%s outbound_url=%s model=%s reason=timeout",
+            command_prefix,
+            generate_url,
+            model_name,
+        )
+        raise HTTPException(status_code=503, detail="Ollama unavailable: request timed out") from exc
+    except httpx.RequestError as exc:
+        logger.error(
+            "Ollama unavailable prefix=%s outbound_url=%s model=%s reason=%s",
+            command_prefix,
+            generate_url,
+            model_name,
+            exc.__class__.__name__,
+        )
+        raise HTTPException(status_code=503, detail="Ollama unavailable: failed to connect") from exc
 
-def save_detection_object(prediction_uid, label, score, box):
-    """
-    Save detection object to database
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO detection_objects (prediction_uid, label, score, box)
-            VALUES (?, ?, ?, ?)
-        """, (prediction_uid, label, score, str(box)))
 
-@app.post("/predict")
-def predict(file: UploadFile = File(...)):
-    """
-    Predict objects in an image
-    """
-    ext = os.path.splitext(file.filename)[1]
-    uid = str(uuid.uuid4())
-    original_path = os.path.join(UPLOAD_DIR, uid + ext)
-    predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
+def _run_yolo_detection(image_bytes: bytes) -> list[dict]:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    results = YOLO_MODEL(image, verbose=False)
 
-    with open(original_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    results = model(original_path, device="cpu")
-
-    annotated_frame = results[0].plot()  # NumPy image with boxes
-    annotated_image = Image.fromarray(annotated_frame)
-    annotated_image.save(predicted_path)
-
-    save_prediction_session(uid, original_path, predicted_path)
-    
-    detected_labels = []
-    for box in results[0].boxes:
-        label_idx = int(box.cls[0].item())
-        label = model.names[label_idx]
-        score = float(box.conf[0])
-        bbox = box.xyxy[0].tolist()
-        save_detection_object(uid, label, score, bbox)
-        detected_labels.append(label)
-
-    return {
-        "prediction_uid": uid, 
-        "detection_count": len(results[0].boxes),
-        "labels": detected_labels
-    }
-
-@app.get("/prediction/{uid}")
-def get_prediction_by_uid(uid: str):
-    """
-    Get prediction session by uid with all detected objects
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        # Get prediction session
-        session = conn.execute("SELECT * FROM prediction_sessions WHERE uid = ?", (uid,)).fetchone()
-        if not session:
-            raise HTTPException(status_code=404, detail="Prediction not found")
-            
-        # Get all detection objects for this prediction
-        objects = conn.execute(
-            "SELECT * FROM detection_objects WHERE prediction_uid = ?", 
-            (uid,)
-        ).fetchall()
-        
-        return {
-            "uid": session["uid"],
-            "timestamp": session["timestamp"],
-            "original_image": session["original_image"],
-            "predicted_image": session["predicted_image"],
-            "detection_objects": [
+    detections = []
+    for result in results:
+        for box in result.boxes:
+            class_id = int(box.cls.item())
+            confidence = float(box.conf.item())
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            detections.append(
                 {
-                    "id": obj["id"],
-                    "label": obj["label"],
-                    "score": obj["score"],
-                    "box": obj["box"]
-                } for obj in objects
-            ]
+                    "class_id": class_id,
+                    "label": result.names.get(class_id, str(class_id)),
+                    "confidence": confidence,
+                    "bbox": {
+                        "x1": float(x1),
+                        "y1": float(y1),
+                        "x2": float(x2),
+                        "y2": float(y2),
+                    },
+                }
+            )
+    return detections
+
+
+@app.post("/process-command")
+async def process_command(payload: CommandPayload):
+    command = payload.command_text.strip()
+
+    if command.startswith("ask/"):
+        raw_prompt = command[len("ask/") :].strip()
+        if not raw_prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        storage_key = await save_prompt(payload.user_id, raw_prompt)
+        response_text = await call_ollama_generate(
+            {
+                "model": _ollama_model_ask(),
+                "prompt": raw_prompt,
+                "stream": False,
+            },
+            command_prefix="ask",
+        )
+        return {
+            "response_text": response_text,
+            "storage_key": storage_key,
+            "storage_backend": _storage_backend(),
         }
 
-@app.get("/predictions/label/{label}")
-def get_predictions_by_label(label: str):
-    """
-    Get prediction sessions containing objects with specified label
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT DISTINCT ps.uid, ps.timestamp
-            FROM prediction_sessions ps
-            JOIN detection_objects do ON ps.uid = do.prediction_uid
-            WHERE do.label = ?
-        """, (label,)).fetchall()
-        
-        return [{"uid": row["uid"], "timestamp": row["timestamp"]} for row in rows]
+    if command.startswith("analyze/"):
+        raw_prompt = command[len("analyze/") :].strip()
+        if not raw_prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+        if not payload.image_url:
+            raise HTTPException(status_code=400, detail="image_url is required for analyze/")
 
-@app.get("/predictions/score/{min_score}")
-def get_predictions_by_score(min_score: float):
-    """
-    Get prediction sessions containing objects with score >= min_score
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT DISTINCT ps.uid, ps.timestamp
-            FROM prediction_sessions ps
-            JOIN detection_objects do ON ps.uid = do.prediction_uid
-            WHERE do.score >= ?
-        """, (min_score,)).fetchall()
-        
-        return [{"uid": row["uid"], "timestamp": row["timestamp"]} for row in rows]
+        storage_key, image_bytes = await download_image_and_upload_to_s3(
+            user_id=payload.user_id,
+            image_url=payload.image_url,
+            prefix="analyzations",
+        )
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        response_text = await call_ollama_generate(
+            {
+                "model": _ollama_model_analyze(),
+                "prompt": raw_prompt,
+                "stream": False,
+                "images": [image_b64],
+            },
+            command_prefix="analyze",
+        )
+        return {
+            "response_text": response_text,
+            "storage_key": storage_key,
+            "storage_backend": _storage_backend(),
+        }
 
-@app.get("/image/{type}/{filename}")
-def get_image(type: str, filename: str):
-    """
-    Get image by type and filename
-    """
-    if type not in ["original", "predicted"]:
-        raise HTTPException(status_code=400, detail="Invalid image type")
-    path = os.path.join("uploads", type, filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(path)
+    if command.startswith("detect/"):
+        if not payload.image_url:
+            raise HTTPException(status_code=400, detail="image_url is required for detect/")
 
-@app.get("/prediction/{uid}/image")
-def get_prediction_image(uid: str, request: Request):
-    """
-    Get prediction image by uid
-    """
-    accept = request.headers.get("accept", "")
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT predicted_image FROM prediction_sessions WHERE uid = ?", (uid,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Prediction not found")
-        image_path = row[0]
+        storage_key, image_bytes = await download_image_and_upload_to_s3(
+            user_id=payload.user_id,
+            image_url=payload.image_url,
+            prefix="detections",
+        )
+        detections = await asyncio.to_thread(_run_yolo_detection, image_bytes)
 
-    if not os.path.exists(image_path):
-        raise HTTPException(status_code=404, detail="Predicted image file not found")
+        return {
+            "status": "success",
+            "model": "yolov8n.pt",
+            "detections": detections,
+            "count": len(detections),
+            "storage_key": storage_key,
+            "storage_backend": _storage_backend(),
+        }
 
-    if "image/png" in accept:
-        return FileResponse(image_path, media_type="image/png")
-    elif "image/jpeg" in accept or "image/jpg" in accept:
-        return FileResponse(image_path, media_type="image/jpeg")
-    else:
-        # If the client doesn't accept image, respond with 406 Not Acceptable
-        raise HTTPException(status_code=406, detail="Client does not accept an image format")
+    raise HTTPException(status_code=400, detail="Unsupported command prefix")
 
-@app.get("/health")
-def health():
-    """
-    Health check endpoint
-    """
-    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8080)

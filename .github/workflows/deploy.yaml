@@ -1,45 +1,102 @@
-name: Yolo Deploy
+name: Deploy App
 
 on:
-  push:
-    branches:
-     - main
-
-  workflow_dispatch:
-
-env:
-  REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
-  REPO_NAME: ${{ github.event.repository.name }}
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
 
 jobs:
-  Deploy:
+  deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure SSH
+      - name: Prepare directory on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: mkdir -p ~/ai-gateway-deploy
+
+      - name: Copy compose file to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: docker-compose.app.yaml
+          target: ~/ai-gateway-deploy
+
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.0.3
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/private_key
-          chmod 400 ~/.ssh/private_key
-          cat > ~/.ssh/config << EOF
-          Host ec2
-              HostName $EC2_HOST
-              User $EC2_USERNAME
-              IdentityFile ~/.ssh/private_key
-              StrictHostKeyChecking no
-          EOF
+          IMG_NAME: ${{ secrets.DOCKERHUB_USERNAME }}${{ inputs.image }}
+          ENVIRONMENT: production
+          STORAGE_BACKEND: s3
+          NOSQL_DB_PATH: local_test_store.json
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          AWS_DEFAULT_REGION: eu-north-1
+          OLLAMA_BASE_URL: http://host.docker.internal:11434
+          OLLAMA_GENERATE_PATH: /api/generate
+          OLLAMA_MODEL_ASK: llama3.2:1b
+          OLLAMA_MODEL_ANALYZE: llava
+          OLLAMA_TIMEOUT_SECONDS: "60"
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 15m
+          envs: IMG_NAME,ENVIRONMENT,STORAGE_BACKEND,NOSQL_DB_PATH,S3_BUCKET_NAME,AWS_DEFAULT_REGION,OLLAMA_BASE_URL,OLLAMA_GENERATE_PATH,OLLAMA_MODEL_ASK,OLLAMA_MODEL_ANALYZE,OLLAMA_TIMEOUT_SECONDS,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN
+          script: |
+            set -euo pipefail
 
-      - name: Copy script to EC2
-        run: |
-          # Clone repository if it doesn't exist, otherwise pull latest changes
-          ssh ec2 "if [ -d ~/${REPO_NAME} ]; then cd ~/${REPO_NAME} && git pull; else git clone ${REPO_URL} ~/${REPO_NAME}; fi"
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Docker not found. Installing official Docker Engine..."
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sudo sh get-docker.sh
+              sudo systemctl enable --now docker
+            fi
 
-      - name: Execute script on EC2
-        run: |
-          ssh ec2 "cd $REPO_NAME && bash deploy.sh"
+            if ! docker compose version >/dev/null 2>&1; then
+              echo "Docker Compose plugin not found."
+              exit 1
+            fi
+
+            if [[ "${STORAGE_BACKEND}" == "s3" && -z "${S3_BUCKET_NAME}" ]]; then
+              echo "S3_BUCKET_NAME is required when STORAGE_BACKEND=s3."
+              exit 1
+            fi
+
+            cd ~/ai-gateway-deploy
+
+            mv docker-compose.app.yaml docker-compose.yml || true
+
+            cat > .env << EOL
+            IMG_NAME=${IMG_NAME}
+            ENVIRONMENT=${ENVIRONMENT}
+            STORAGE_BACKEND=${STORAGE_BACKEND}
+            NOSQL_DB_PATH=${NOSQL_DB_PATH}
+            S3_BUCKET_NAME=${S3_BUCKET_NAME}
+            AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+            OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+            OLLAMA_GENERATE_PATH=${OLLAMA_GENERATE_PATH}
+            OLLAMA_MODEL_ASK=${OLLAMA_MODEL_ASK}
+            OLLAMA_MODEL_ANALYZE=${OLLAMA_MODEL_ANALYZE}
+            OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS}
+            EOL
+
+            echo "${DOCKERHUB_TOKEN}" | sudo docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+
+            sudo -E docker compose down --remove-orphans || true
+            sudo -E docker compose pull
+            sudo -E docker compose up -d
+            sudo docker image prune -f
+
+            echo "Deployment completed successfully!"
