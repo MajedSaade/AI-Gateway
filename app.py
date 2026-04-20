@@ -31,6 +31,35 @@ class CommandPayload(BaseModel):
     image_url: Optional[str] = None
 
 
+def _parse_command(command_text: str) -> tuple[str, str]:
+    text = command_text.strip()
+    if not text:
+        return "", ""
+
+    known_prefixes = {"ask", "analyze", "detect"}
+
+    # Accept formats like: ask/..., /ask ..., ask ...
+    normalized = text[1:] if text.startswith("/") else text
+
+    if "/" in normalized:
+        prefix, rest = normalized.split("/", 1)
+        prefix = prefix.strip().lower()
+        if prefix in known_prefixes:
+            return prefix, rest.strip()
+
+    if " " in normalized:
+        prefix, rest = normalized.split(None, 1)
+        prefix = prefix.strip().lower()
+        if prefix in known_prefixes:
+            return prefix, rest.strip()
+
+    prefix = normalized.strip().lower()
+    if prefix in known_prefixes:
+        return prefix, ""
+
+    return "", text
+
+
 def _storage_backend() -> str:
     return os.getenv("STORAGE_BACKEND", "s3").strip().lower()
 
@@ -281,14 +310,24 @@ def _run_yolo_detection(image_bytes: bytes) -> list[dict]:
 
 @app.post("/process-command")
 async def process_command(payload: CommandPayload):
-    command = payload.command_text.strip()
+    command_prefix, raw_prompt = _parse_command(payload.command_text)
 
-    if command.startswith("ask/"):
-        raw_prompt = command[len("ask/") :].strip()
+    if command_prefix == "ask":
         if not raw_prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-        storage_key = await save_prompt(payload.user_id, raw_prompt)
+        storage_key: Optional[str] = None
+        storage_error: Optional[str] = None
+        try:
+            storage_key = await save_prompt(payload.user_id, raw_prompt)
+        except HTTPException as exc:
+            storage_error = str(exc.detail)
+            logger.warning(
+                "ask storage write failed user_id=%s reason=%s",
+                payload.user_id,
+                storage_error,
+            )
+
         response_text = await call_ollama_generate(
             {
                 "model": _ollama_model_ask(),
@@ -300,11 +339,11 @@ async def process_command(payload: CommandPayload):
         return {
             "response_text": response_text,
             "storage_key": storage_key,
+            "storage_error": storage_error,
             "storage_backend": _storage_backend(),
         }
 
-    if command.startswith("analyze/"):
-        raw_prompt = command[len("analyze/") :].strip()
+    if command_prefix == "analyze":
         if not raw_prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
         if not payload.image_url:
@@ -331,7 +370,7 @@ async def process_command(payload: CommandPayload):
             "storage_backend": _storage_backend(),
         }
 
-    if command.startswith("detect/"):
+    if command_prefix == "detect":
         if not payload.image_url:
             raise HTTPException(status_code=400, detail="image_url is required for detect/")
 
@@ -351,7 +390,10 @@ async def process_command(payload: CommandPayload):
             "storage_backend": _storage_backend(),
         }
 
-    raise HTTPException(status_code=400, detail="Unsupported command prefix")
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported command prefix. Use ask, analyze, or detect.",
+    )
 
 
 if __name__ == "__main__":
