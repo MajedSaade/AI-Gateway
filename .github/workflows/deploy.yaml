@@ -29,7 +29,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: docker-compose.app.yaml
+          source: docker-compose.yml
           target: ~/ai-gateway-deploy
 
       - name: Deploy on EC2
@@ -75,8 +75,6 @@ jobs:
             fi
 
             cd ~/ai-gateway-deploy
-
-            mv docker-compose.app.yaml docker-compose.yml || true
 
             cat > .env << EOL
             IMG_NAME=${IMG_NAME}
