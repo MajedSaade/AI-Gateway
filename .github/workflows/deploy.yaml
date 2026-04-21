@@ -95,6 +95,19 @@ jobs:
             sudo -E docker compose down --remove-orphans || true
             sudo -E docker compose pull
             sudo -E docker compose up -d
+
+            echo "Waiting for Ollama to become ready..."
+            for i in {1..30}; do
+              if sudo docker compose exec -T ollama-engine ollama list >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            echo "Ensuring required Ollama models are available..."
+            sudo docker compose exec -T ollama-engine ollama pull "${OLLAMA_MODEL_ASK}"
+            sudo docker compose exec -T ollama-engine ollama pull "${OLLAMA_MODEL_ANALYZE}"
+
             sudo docker image prune -f
 
             echo "Deployment completed successfully!"

@@ -351,11 +351,23 @@ async def process_command(payload: CommandPayload):
         if not payload.image_url:
             raise HTTPException(status_code=400, detail="image_url is required for analyze/")
 
-        storage_key, image_bytes = await download_image_and_upload_to_s3(
-            user_id=payload.user_id,
-            image_url=payload.image_url,
-            prefix="analyzations",
-        )
+        image_bytes = await download_image(payload.image_url)
+        storage_key: Optional[str] = None
+        storage_error: Optional[str] = None
+        try:
+            storage_key = await save_image(
+                user_id=payload.user_id,
+                image_bytes=image_bytes,
+                prefix="analyzations",
+            )
+        except HTTPException as exc:
+            storage_error = str(exc.detail)
+            logger.warning(
+                "analyze storage write failed user_id=%s reason=%s",
+                payload.user_id,
+                storage_error,
+            )
+
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         response_text = await call_ollama_generate(
             {
@@ -369,6 +381,7 @@ async def process_command(payload: CommandPayload):
         return {
             "response_text": response_text,
             "storage_key": storage_key,
+            "storage_error": storage_error,
             "storage_backend": _storage_backend(),
         }
 
@@ -376,11 +389,23 @@ async def process_command(payload: CommandPayload):
         if not payload.image_url:
             raise HTTPException(status_code=400, detail="image_url is required for detect/")
 
-        storage_key, image_bytes = await download_image_and_upload_to_s3(
-            user_id=payload.user_id,
-            image_url=payload.image_url,
-            prefix="detections",
-        )
+        image_bytes = await download_image(payload.image_url)
+        storage_key: Optional[str] = None
+        storage_error: Optional[str] = None
+        try:
+            storage_key = await save_image(
+                user_id=payload.user_id,
+                image_bytes=image_bytes,
+                prefix="detections",
+            )
+        except HTTPException as exc:
+            storage_error = str(exc.detail)
+            logger.warning(
+                "detect storage write failed user_id=%s reason=%s",
+                payload.user_id,
+                storage_error,
+            )
+
         detections = await asyncio.to_thread(_run_yolo_detection, image_bytes)
 
         return {
@@ -389,6 +414,7 @@ async def process_command(payload: CommandPayload):
             "detections": detections,
             "count": len(detections),
             "storage_key": storage_key,
+            "storage_error": storage_error,
             "storage_backend": _storage_backend(),
         }
 

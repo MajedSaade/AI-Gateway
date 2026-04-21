@@ -16,6 +16,14 @@ services:
       - "8080:8080"
     environment:
       OLLAMA_URL: http://ollama-engine:11434
+      OLLAMA_GENERATE_PATH: ${OLLAMA_GENERATE_PATH:-/api/generate}
+      OLLAMA_MODEL_ASK: ${OLLAMA_MODEL_ASK:-llama3.2:1b}
+      OLLAMA_MODEL_ANALYZE: ${OLLAMA_MODEL_ANALYZE:-llava}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-60}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      NOSQL_DB_PATH: ${NOSQL_DB_PATH:-local_test_store.json}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-north-1}
     depends_on:
       - ollama-engine
 
