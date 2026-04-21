@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  ollama-engine:
+    image: ollama/ollama:latest
+    container_name: ollama-engine
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  ai-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      OLLAMA_URL: http://ollama-engine:11434
+    depends_on:
+      - ollama-engine
+
+volumes:
+  ollama_data:

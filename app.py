@@ -69,7 +69,9 @@ def _nosql_db_path() -> str:
 
 
 def _ollama_base_url() -> str:
-    return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
+    # Prefer OLLAMA_URL for container-to-container routing in Compose/Kubernetes.
+    base_url = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://ollama-engine:11434")
+    return base_url.strip()
 
 
 def _ollama_generate_path() -> str:

@@ -26,7 +26,7 @@ Gateway routes all command execution via `POST /process-command`, and internally
 Ollama config defaults:
 
 ```env
-OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_GENERATE_PATH=/api/generate
 OLLAMA_MODEL_ASK=llama3.2:1b
 OLLAMA_MODEL_ANALYZE=llava
@@ -42,7 +42,7 @@ Set these environment variables in your local `.env`:
 ```env
 STORAGE_BACKEND=nosql
 NOSQL_DB_PATH=local_test_store.json
-OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_GENERATE_PATH=/api/generate
 OLLAMA_MODEL_ASK=llama3.2:1b
 OLLAMA_MODEL_ANALYZE=llava
@@ -140,7 +140,7 @@ Static deployment values are currently hardcoded in workflows:
 - `STORAGE_BACKEND=s3`
 - `NOSQL_DB_PATH=local_test_store.json`
 - `AWS_DEFAULT_REGION=eu-north-1`
-- `OLLAMA_BASE_URL=http://host.docker.internal:11434`
+- `OLLAMA_URL=http://host.docker.internal:11434`
 - `OLLAMA_GENERATE_PATH=/api/generate`
 - `OLLAMA_MODEL_ASK=llama3.2:1b`
 - `OLLAMA_MODEL_ANALYZE=llava`
